@@ -55,6 +55,13 @@ requires-python = ">=3.9"
 vllm = [
     "vllm>=0.2.0",
 ]
+# BigCodeBench runs (Python >= 3.10). The pins must match the Colab evaluator notebook and the
+# README. Tasks are read from the Hugging Face Hub with datasets (a core dependency), so the
+# bigcodebench package is only installed in the Colab evaluator, not here.
+bigcodebench = [
+    "gradio_client==2.7.2",
+    "anthropic==1.11.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",

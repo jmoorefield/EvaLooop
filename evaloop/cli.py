@@ -34,7 +34,10 @@ class EvaLoopCLI:
     
     Available Commands:
         evaluate        Run code generation and summarization evaluation
-        analyze         Analyze evaluation results and generate reports  
+        analyze         Analyze evaluation results and generate reports
+        compare         Compare BigCodeBench runs with their MBPP Plus baseline
+        inspect sample  Draw failed loops for manual inspection
+        summary        Write summary.csv (one row per run, baselines included)
         list_models     List all available pre-configured models
         validate_setup  Validate EvaLoop setup and environment
     
@@ -66,6 +69,8 @@ class EvaLoopCLI:
     def __init__(self):
         """Initialize the EvaLoop CLI."""
         self.logger = None
+        # Command group: `evaloop inspect sample ...`
+        self.inspect = InspectCommands()
 
     def evaluate(
         self,
@@ -92,7 +97,11 @@ class EvaLoopCLI:
         preferred_batch_size: int = 64,
         is_chat_model: bool = True,
         system_prompt: str = "You are a helpful programming assistant.",
-    ) -> Dict[str, Any]:
+        bcb_trial: bool = False,
+        bcb_trial_seed: int = 0,
+        bcb_parallel: int = 2,
+        resume_from: Optional[str] = None,
+    ) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
         """
         Run code generation and summarization evaluation experiment.
         
@@ -106,7 +115,10 @@ class EvaLoopCLI:
         Args:
             model: Single model name/path to evaluate.
                    Examples: "gpt-4", "Qwen/Qwen2.5-Coder-32B-Instruct"
-            dataset: Dataset to use for evaluation. Currently only "mbpp_plus" is supported.
+            dataset: Dataset to use for evaluation: "mbpp_plus" or "bigcodebench" (the
+                     standard loop on BigCodeBench-Hard, Complete split, tested by a BigCodeBench Gradio
+                     evaluator whose URL is read from $EVALOOP_GRADIO_ENDPOINT; see
+                     extension-README.md).
             max_cycles: Maximum number of evaluation cycles to run.
             temperature: Temperature for model generation (0.0 for greedy decoding).
             top_p: Top-p (nucleus) sampling parameter.
@@ -128,6 +140,10 @@ class EvaLoopCLI:
             preferred_batch_size: Preferred batch size when auto-batching.
             is_chat_model: Whether the model is a chat/instruction-tuned model.
             system_prompt: System prompt for chat models.
+            bcb_trial: Run the 10-task trial (full protocol, not reportable) before the real run.
+            bcb_trial_seed: Seed used to pick the trial tasks.
+            bcb_parallel: Evaluator worker processes (default sized for free Colab).
+            resume_from: BigCodeBench checkpoint to resume (after an interruption).
 
         Returns:
             Dictionary containing evaluation results with successful cycles for each task.
@@ -149,13 +165,25 @@ class EvaLoopCLI:
                              --experiment_name "deepseek_robust_test"
         """
         
-        if dataset != "mbpp_plus":
+        if dataset not in ("mbpp_plus", "bigcodebench"):
             raise ValueError(
-                f"Unsupported dataset: '{dataset}'. Only 'mbpp_plus' is currently supported."
+                f"Unsupported dataset: '{dataset}'. Supported: 'mbpp_plus', 'bigcodebench'."
             )
 
+        bcb_config = None
+        if dataset == "bigcodebench":
+            from .core.bigcodebench_config import BigCodeBenchConfig
+
+            bcb_config = BigCodeBenchConfig(
+                trial=bcb_trial,
+                trial_seed=bcb_trial_seed,
+                parallel=bcb_parallel,
+                resume_from=resume_from,
+            )
+        elif bcb_trial or resume_from:
+            raise ValueError("BigCodeBench options (--bcb_trial, --resume_from) need --dataset bigcodebench")
+
         from .core.config import EvaluationConfig
-        from .core.evaluator import EvaLoopEvaluator
 
         # Setup logging
         self.logger = setup_logging(level=log_level)
@@ -176,6 +204,7 @@ class EvaLoopCLI:
                 gpu_id_list = [int(gpu_ids)]  # Single GPU ID
 
         # Setup API key
+        # Anthropic API key loaded in models/anthropic_llm.py 
         if openai_api_key:
             os.environ["OPENAI_API_KEY"] = openai_api_key
 
@@ -218,8 +247,19 @@ class EvaLoopCLI:
             self.logger.info(f"  API config: model_id={model_config['model_id']}")
 
         # Create and run evaluator
-        evaluator = EvaLoopEvaluator(config)
-        results = evaluator.run_code_generation_summarization()
+        if bcb_config is not None:
+            from .core.bigcodebench_evaluator import BigCodeBenchEvaluator
+
+            BigCodeBenchEvaluator(config, bcb_config).run()
+            # Return nothing: Fire would print the whole results dict to the terminal.
+            # The evaluator has already logged where the results file was saved.
+            self.logger.info("Evaluation completed successfully")
+            return None
+        else:
+            from .core.evaluator import EvaLoopEvaluator
+
+            evaluator = EvaLoopEvaluator(config)
+            results = evaluator.run_code_generation_summarization()
 
         self.logger.info("Evaluation completed successfully")
         return results
@@ -324,6 +364,81 @@ class EvaLoopCLI:
         self.logger.info(f"Analysis completed. Results saved to: {output_dir}")
         return analysis_results
 
+    def compare(
+        self,
+        runs: Union[str, Sequence[str]],
+        baseline_dir: str = "data/assignment2-data",
+        output_dir: str = "results/compare",
+        include_trial: bool = False,
+        log_level: str = "INFO",
+    ) -> Dict[str, str]:
+        """
+        Compare BigCodeBench runs with the same models' MBPP Plus baseline.
+
+        Computes success rate, unweighted ASL, robustnessScore, pass_drop and survival curves for each
+        run and for its baseline (recomputed from the data package's loops/), the changes between
+        them, the models' baseline ranks, and the ranking among the evaluated models on each
+        benchmark.
+        Writes comparison.json and comparison.md (numbers and ids only) to output_dir and returns
+        their paths.
+
+        Args:
+            runs: Comma-separated model_id=results_path entries; model_id is the package id of
+                the run's baseline (e.g. "claude-sonnet-4.5=results/a.json,gpt-4.1-mini=results/b.json").
+            baseline_dir: The unzipped assignment2-data package.
+            output_dir: Where to write the report.
+            include_trial: Accept trial runs (the report is then labelled as trial output).
+            log_level: Logging level.
+
+        Usage:
+            evaloop compare --runs "claude-sonnet-4.5=results/x_bigcodebench_results.json,gpt-4.1-mini=results/y_bigcodebench_results.json"
+        """
+        self.logger = setup_logging(level=log_level)
+        from evaloop.analysis import compare as comparison
+
+        loaded = comparison.load_runs(runs, include_trial=include_trial)
+        report = comparison.compare(loaded, baseline_dir)
+        json_path, md_path = comparison.write_report(report, output_dir)
+        self.logger.info(f"Comparison written to {json_path} and {md_path}")
+        return {"json": str(json_path), "markdown": str(md_path)}
+
+    def summary(
+        self,
+        runs: Union[str, Sequence[str]],
+        baseline_dir: str = "data/assignment2-data",
+        out: Optional[str] = None,
+        include_trial: bool = False,
+        log_level: str = "INFO",
+    ) -> str:
+        """
+        Write summary.csv: one row per run, plus each model's standard-mbpp-plus baseline row.
+
+        Header: model,configuration,n_tasks,success_rate,asl_score. asl_score is the unweighted
+        ASL (the data package's aslScore); baseline rows are recomputed from loops/.
+
+        Args:
+            runs: Comma-separated model_id=results_path entries (see `evaloop compare`).
+            baseline_dir: The unzipped assignment2-data package.
+            out: Output path (default results/summary.csv, or results/summary_trial.csv when
+                trial runs are included).
+            include_trial: Accept trial runs (their configuration names end in -trial10).
+            log_level: Logging level.
+
+        Usage:
+            evaloop summary --runs "claude-sonnet-4.5=results/x_bigcodebench_results.json,gpt-4.1-mini=results/y_bigcodebench_results.json"
+        """
+        self.logger = setup_logging(level=log_level)
+        from evaloop.analysis import compare as comparison
+        from evaloop.analysis import summary_csv
+
+        loaded = comparison.load_runs(runs, include_trial=include_trial)
+        if out is None:
+            trial = any(run.trial for run in loaded)
+            out = str(summary_csv.DEFAULT_TRIAL_OUT if trial else summary_csv.DEFAULT_OUT)
+        path = summary_csv.write_summary(summary_csv.summary_rows(loaded, baseline_dir), out)
+        self.logger.info(f"Summary written to {path}")
+        return str(path)
+
     def list_models(self) -> List[str]:
         """
         List all available pre-configured models.
@@ -384,6 +499,51 @@ class EvaLoopCLI:
             print(f"{status_symbol} {check}: {status['message']}")
 
         return results
+
+
+class InspectCommands:
+    """Manual inspection of failed loops (`evaloop inspect sample`)."""
+
+    def sample(
+        self,
+        runs: Union[str, Sequence[str]],
+        n: int = 20,
+        baseline_n: int = 10,
+        seed: int = 1234,
+        baseline_dir: str = "data/assignment2-data",
+        output_dir: str = "results/inspection",
+        overwrite: bool = False,
+        include_trial: bool = False,
+        log_level: str = "INFO",
+    ) -> Dict[str, str]:
+        """
+        Draw a seeded sample of failed loops (and matching baseline loops) for manual inspection.
+
+        Writes annotations.csv (pre-filled ids; fill in the categories by hand), sampling.json
+        (how the sample was drawn) and worksheet.md (a LOCAL working file with each loop's
+        prompts, code and summaries; never commit or submit it). Nothing is executed.
+
+        Args:
+            runs: Comma-separated model_id=results_path entries, one per model (see `evaloop compare`).
+            n: Failed BigCodeBench loops to draw in total, split evenly across models (minimum 20).
+            baseline_n: Failed baseline loops to draw per model.
+            seed: Sampling seed (record it in the README).
+            baseline_dir: The unzipped assignment2-data package.
+            output_dir: Where to write the files.
+            overwrite: Replace an existing annotations.csv (it may hold your annotations).
+            include_trial: Accept trial runs (relaxes the 20-loop minimum; not reportable).
+            log_level: Logging level.
+        """
+        logger = setup_logging(level=log_level)
+        from evaloop.analysis import compare as comparison
+        from evaloop.analysis import inspection
+
+        loaded = comparison.load_runs(runs, include_trial=include_trial)
+        drawn = inspection.sample(loaded, n=n, baseline_n=baseline_n, seed=seed, baseline_dir=baseline_dir)
+        paths = inspection.write_outputs(drawn, output_dir, overwrite=overwrite)
+        logger.info(f"Inspection sample written to {paths['annotations']} and {paths['sampling']}")
+        logger.warning(f"{paths['worksheet']} contains data-package text: keep it local, never commit or submit it")
+        return {name: str(path) for name, path in paths.items()}
 
 
 def _split_list_arg(value: Union[str, Sequence[str]]) -> List[str]:
