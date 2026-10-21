@@ -7,6 +7,8 @@
 
 EvaLoop is a framework for evaluating the robustness of Large Language Models (LLMs) through iterative dual-task cycles. The framework measures how many cycles an LLM can execute before generating code that fails functional testing, providing a quantitative metric for model robustness. It accompanies the paper [*EvaLoop: Assessing LLM Robustness in Programming from a Self-consistency Perspective*](https://arxiv.org/abs/2505.12185); results across models are published on the [leaderboard](https://evalooop.github.io/).
 
+For my extension to support BigCodeBench, see [extension-README.md](extension-README.md) for details and setup instructions.
+
 ## 🚀 Quick Start
 
 ### Installation
